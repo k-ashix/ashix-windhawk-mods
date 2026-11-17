@@ -20,7 +20,7 @@
 
 > **Windows 11 (centered taskbar) only.** On left-aligned or unsupported layouts, the dock stays hidden and idle.
 
-![Live preview of the Left Taskbar Quick Pin Dock](https://raw.githubusercontent.com/k-ashix/taskbar-quick-pin/main/src/preview.gif)
+![Live preview of the Left Taskbar Quick Pin Dock](https://raw.githubusercontent.com/k-ashix/ashix-windhawk-mods/main/Taskbar_Quick_Pin/taskbar-quick-pin.png)
 
 A lightweight, DPI-aware icon dock anchored left of the Start button. Pin apps or File Explorer workspaces, launch or focus with one click, and drag to reorder or unpin.
 
