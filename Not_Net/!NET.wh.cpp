@@ -3,7 +3,7 @@
 // @name            !Net — Per-App Kill Switch
 // @description     A panel to manage per app internet connection.
 // @author          Ashix
-// @version         1.2026.1511
+// @version         1.2026.1711
 // @github          https://github.com/k-ashix
 // @twitter         https://x.com/k_ashix
 // @donateUrl       https://ko-fi.com/kashix
@@ -79,6 +79,9 @@
   - followCursorMonitor: true
     $name: Follow cursor monitor
     $description: Automatically move the collapsed pill and panel to whichever monitor the mouse cursor is currently on.
+  - followCursorDelaySec: 5
+    $name: Monitor switch delay (seconds)
+    $description: Wait time (0-60s, default 5s) after the cursor stays on another monitor before switching the pill to it. Prevents multi-monitor edge jitter.
   - rememberWindowPosition: true
     $name: Remember pill position
   - windowSizePreset: default
@@ -279,6 +282,7 @@ constexpr UINT_PTR TIMER_DEBOUNCE_REFRESH = 6;
 constexpr UINT_PTR TIMER_WIDGET_PROXIMITY = 86;
 constexpr UINT_PTR TIMER_OUTSIDE_CLICK    = 87;
 constexpr UINT_PTR TIMER_LATE_CHILD_POLL  = 88;
+constexpr UINT_PTR TIMER_MONITOR_SWITCH   = 89;
 
 constexpr int HK_TOGGLE_FG   = 1;
 constexpr int HK_EXPAND_PILL = 2;
@@ -332,6 +336,7 @@ struct ModSettings {
     bool showNonActionableInRunning = false;
     bool showTooltips = false;
     bool followCursorMonitor = true;
+    int followCursorDelaySec = 5;
     bool rememberWindowPosition = true;
     SizePreset windowSizePreset = SizePreset::Default;
 
@@ -486,6 +491,9 @@ static int g_lastSettingDockEdge = -1;
 static int g_posX = 0;
 static int g_posY = 0;
 static bool g_posLoaded = false;
+static HMONITOR g_activeMonitor = nullptr;
+static HMONITOR g_candidateMonitor = nullptr;
+static ULONGLONG g_candidateMonitorEnterTick = 0;
 
 static std::mutex g_engineMtx;
 static HANDLE g_wfpEngine = nullptr;
@@ -2850,6 +2858,8 @@ static void LoadSettings() {
     next.showNonActionableInRunning = Wh_GetIntSetting(L"Pill.showNonActionableInRunning") != 0;
     next.showTooltips = Wh_GetIntSetting(L"Pill.showTooltips") != 0;
     next.followCursorMonitor = Wh_GetIntSetting(L"Pill.followCursorMonitor") != 0;
+    int rawMonDelay = Wh_GetIntSetting(L"Pill.followCursorDelaySec");
+    next.followCursorDelaySec = (rawMonDelay >= 0) ? std::clamp(rawMonDelay, 0, 60) : 5;
     next.rememberWindowPosition = Wh_GetIntSetting(L"Pill.rememberWindowPosition") != 0;
 
     auto sPreset = WindhawkUtils::StringSetting::make(L"Pill.windowSizePreset");
@@ -2952,6 +2962,21 @@ static void DrawRoundedRect(Gdiplus::Graphics& g, const Gdiplus::Pen& pen,
     g.DrawPath(&pen, &path);
 }
 
+static void SyncMonitorSwitchTimer(HWND hwnd) {
+    if (!hwnd) return;
+    bool needMonTimer = false;
+    {
+        std::lock_guard<std::mutex> lk(g_settingsMtx);
+        needMonTimer = g_settings.followCursorMonitor && !g_hiddenByFullscreen;
+    }
+    if (needMonTimer) SetTimer(hwnd, TIMER_MONITOR_SWITCH, 150, nullptr);
+    else {
+        KillTimer(hwnd, TIMER_MONITOR_SWITCH);
+        g_candidateMonitor = nullptr;
+        g_candidateMonitorEnterTick = 0;
+    }
+}
+
 static void SyncHoverSensorTimer(HWND hwnd) {
     if (!hwnd) return;
     bool needSensor = false;
@@ -2962,6 +2987,7 @@ static void SyncHoverSensorTimer(HWND hwnd) {
     }
     if (needSensor) SetTimer(hwnd, TIMER_HOVER_SENSOR, 75, nullptr);
     else KillTimer(hwnd, TIMER_HOVER_SENSOR);
+    SyncMonitorSwitchTimer(hwnd);
 }
 
 static void SetWindowFrameMode(HWND hwnd, bool roundedPanel) {
@@ -2995,13 +3021,47 @@ static SIZE GetExpandedLogicalSize() {
     }
 }
 
+static bool IsValidMonitorHandle(HMONITOR mon, MONITORINFO* outMi = nullptr) {
+    if (!mon) return false;
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    if (outMi) *outMi = mi;
+    return true;
+}
+
+static void RemapSavedPositionBetweenMonitors(HMONITOR oldMon, HMONITOR newMon) {
+    if (!g_posLoaded || !oldMon || !newMon || oldMon == newMon) return;
+    MONITORINFO oldMi{sizeof(oldMi)}, newMi{sizeof(newMi)};
+    if (!IsValidMonitorHandle(oldMon, &oldMi) || !IsValidMonitorHandle(newMon, &newMi)) return;
+    const RECT& owa = oldMi.rcWork;
+    const RECT& nwa = newMi.rcWork;
+    long ow = std::max<long>(1, owa.right - owa.left);
+    long oh = std::max<long>(1, owa.bottom - owa.top);
+    long nw = std::max<long>(1, nwa.right - nwa.left);
+    long nh = std::max<long>(1, nwa.bottom - nwa.top);
+    double rx = std::clamp((double)(g_posX - owa.left) / (double)ow, 0.0, 1.0);
+    double ry = std::clamp((double)(g_posY - owa.top) / (double)oh, 0.0, 1.0);
+    g_posX = nwa.left + (int)std::round(rx * (double)nw);
+    g_posY = nwa.top + (int)std::round(ry * (double)nh);
+}
+
 static HMONITOR GetTargetMonitor(bool followCursor) {
+    if (IsValidMonitorHandle(g_activeMonitor)) {
+        return g_activeMonitor;
+    }
+    HMONITOR resolved = nullptr;
     if (followCursor && !g_drag.dragging) {
         POINT cur{};
-        if (GetCursorPos(&cur)) return MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
+        if (GetCursorPos(&cur)) resolved = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
     }
-    return g_hWnd ? MonitorFromWindow(g_hWnd, MONITOR_DEFAULTTONEAREST)
-                  : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (!resolved) {
+        resolved = g_hWnd ? MonitorFromWindow(g_hWnd, MONITOR_DEFAULTTONEAREST)
+                          : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    }
+    g_activeMonitor = resolved;
+    g_candidateMonitor = nullptr;
+    g_candidateMonitorEnterTick = 0;
+    return g_activeMonitor;
 }
 
 static void ComputeTargetRect(double progress, RECT& outRc) {
@@ -3924,6 +3984,9 @@ struct CyclePopupState {
     bool sideBySideBlockAllow = false;
     MotionClock openClock;
     MotionClock heightClock;
+    HMONITOR targetMonitor = nullptr;
+    POINT anchorPt{};
+    bool initialPlacementDone = false;
     int targetX = 0;
     int targetY = 0;
     int targetW = 0;
@@ -4325,7 +4388,10 @@ static void LayoutCyclePopup(CyclePopupState* st, UINT dpi, bool animateResize) 
 
     RECT curRc{};
     GetWindowRect(st->hwnd, &curRc);
-    HMONITOR mon = MonitorFromWindow(st->hwnd, MONITOR_DEFAULTTONEAREST);
+    HMONITOR mon = (st->targetMonitor && IsValidMonitorHandle(st->targetMonitor))
+                       ? st->targetMonitor
+                       : GetTargetMonitor(false);
+    st->targetMonitor = mon;
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(mon, &mi);
     int edgeOffPx = 0;
@@ -4337,8 +4403,11 @@ static void LayoutCyclePopup(CyclePopupState* st, UINT dpi, bool animateResize) 
     int maxX = std::max(minX, (int)mi.rcWork.right - edgeOffPx - winW);
     int minY = (int)mi.rcWork.top + edgeOffPx;
     int maxY = std::max(minY, (int)mi.rcWork.bottom - edgeOffPx - totalH);
-    int nx = std::clamp((int)curRc.left, minX, maxX);
-    int ny = std::clamp((int)curRc.top, minY, maxY);
+    int baseX = st->initialPlacementDone ? (int)curRc.left : (int)st->anchorPt.x;
+    int baseY = st->initialPlacementDone ? (int)curRc.top  : (int)st->anchorPt.y;
+    int nx = std::clamp(baseX, minX, maxX);
+    int ny = std::clamp(baseY, minY, maxY);
+    st->initialPlacementDone = true;
     st->targetX = nx;
     st->targetY = ny;
     st->targetW = winW;
@@ -4991,6 +5060,24 @@ static void OpenCustomRunDropdown(CyclePopupState* st) {
     int dropH = pad * 2 + 3 * itemH;
     POINT pt{st->rcRunDrop.left, st->rcRunDrop.bottom + DpiScale(4, dpi)};
     ClientToScreen(st->hwnd, &pt);
+    HMONITOR mon = (st->targetMonitor && IsValidMonitorHandle(st->targetMonitor))
+                       ? st->targetMonitor
+                       : GetTargetMonitor(false);
+    MONITORINFO mi{sizeof(mi)};
+    if (GetMonitorInfoW(mon, &mi)) {
+        int minX = (int)mi.rcWork.left + DpiScale(4, dpi);
+        int maxX = std::max(minX, (int)mi.rcWork.right - DpiScale(4, dpi) - dropW);
+        int minY = (int)mi.rcWork.top + DpiScale(4, dpi);
+        int maxY = std::max(minY, (int)mi.rcWork.bottom - DpiScale(4, dpi) - dropH);
+        pt.x = std::clamp((int)pt.x, minX, maxX);
+        if (pt.y + dropH > mi.rcWork.bottom) {
+            POINT ptAbove{st->rcRunDrop.left, st->rcRunDrop.top - dropH - DpiScale(4, dpi)};
+            ClientToScreen(st->hwnd, &ptAbove);
+            pt.y = std::clamp((int)ptAbove.y, minY, maxY);
+        } else {
+            pt.y = std::clamp((int)pt.y, minY, maxY);
+        }
+    }
 
     st->runDropHoverIdx = st->runModeIdx;
     st->openingRunDrop = true;
@@ -5448,11 +5535,26 @@ static void OpenCyclePopupForApp(const AppEntry& app) {
 
     POINT pt{};
     GetCursorPos(&pt);
-    // Create hidden first, lay out to exact DPI size, then show without flash
+    HMONITOR targetMon = GetTargetMonitor(true);
+    st->targetMonitor = targetMon;
+    g_candidateMonitor = nullptr;
+    g_candidateMonitorEnterTick = 0;
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(targetMon, &mi);
+    if (g_uiState == UiState::Line && g_hCycleWidget && IsWindowVisible(g_hCycleWidget)) {
+        RECT wrc{};
+        GetWindowRect(g_hCycleWidget, &wrc);
+        pt.x = (wrc.left + wrc.right) / 2;
+        pt.y = (wrc.top + wrc.bottom) / 2;
+    }
+    st->anchorPt = pt;
+    int initX = std::clamp((int)pt.x, (int)mi.rcWork.left + 16, std::max((int)mi.rcWork.left + 16, (int)mi.rcWork.right - 276));
+    int initY = std::clamp((int)pt.y, (int)mi.rcWork.top + 16, std::max((int)mi.rcWork.top + 16, (int)mi.rcWork.bottom - 276));
+    // Create inside the pinned active monitor first so Windows assigns the right monitor DPI without crossing seams
     HWND hPopup = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
         kCyclePopupClass, L"Cycle Mode", WS_POPUP,
-        pt.x, pt.y, 260, 260,
+        initX, initY, 260, 260,
         g_hWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hPopup) {
         delete st;
@@ -5745,7 +5847,7 @@ static void RenderCycleWidgetLayered(HWND hwnd) {
         sizeStep = std::clamp(g_settings.cycleWidgetSize, 0, 10);
     }
 
-    UINT dpi = GetDpiForWindow(hwnd);
+    UINT dpi = g_hWnd ? GetDpiForWindow(g_hWnd) : GetDpiForWindow(hwnd);
     HDC hdcScreen = GetDC(nullptr);
     HDC memDC = CreateCompatibleDC(hdcScreen);
     BITMAPINFO bmi{};
@@ -5935,13 +6037,26 @@ static LRESULT CALLBACK CycleWidgetWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             return 0;
         }
         case WM_LBUTTONDOWN: {
+            g_candidateMonitor = nullptr;
+            g_candidateMonitorEnterTick = 0;
+            SetCapture(hwnd);
             g_cycleWidgetPressed = true;
             RenderCycleWidgetLayered(hwnd);
             return 0;
         }
         case WM_LBUTTONUP: {
+            bool wasPressed = g_cycleWidgetPressed;
             g_cycleWidgetPressed = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
             RenderCycleWidgetLayered(hwnd);
+            if (!wasPressed) return 0;
+            POINT cur{};
+            GetCursorPos(&cur);
+            RECT wrc{};
+            GetWindowRect(hwnd, &wrc);
+            UINT dpi = g_hWnd ? GetDpiForWindow(g_hWnd) : GetDpiForWindow(hwnd);
+            InflateRect(&wrc, DpiScale(14, dpi), DpiScale(14, dpi));
+            if (!PtInRect(&wrc, cur)) return 0;
             CycleStatusSnapshot snap;
             if (GetWidgetCycleTarget(snap)) {
                 g_widgetClickExe = snap.exePath;
@@ -5953,6 +6068,9 @@ static LRESULT CALLBACK CycleWidgetWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
         }
         case WM_LBUTTONDBLCLK: {
             KillTimer(hwnd, TIMER_WIDGET_SINGLE_CLICK);
+            g_candidateMonitor = nullptr;
+            g_candidateMonitorEnterTick = 0;
+            if (GetCapture() == hwnd) ReleaseCapture();
             g_cycleWidgetPressed = false;
             RenderCycleWidgetLayered(hwnd);
             CycleStatusSnapshot snap;
@@ -6045,11 +6163,11 @@ static void SetCycleWidgetRevealed(bool reveal) {
     if (!g_hCycleWidget || !IsWindow(g_hCycleWidget)) return;
 
     if (reveal) {
-        ShowWindow(g_hCycleWidget, SW_SHOWNOACTIVATE);
         g_widgetRevealClock.Start(1.0, 180.0);
+        RenderCycleWidgetLayered(g_hCycleWidget);
+        ShowWindow(g_hCycleWidget, SW_SHOWNOACTIVATE);
         SetTimer(g_hCycleWidget, TIMER_WIDGET_REVEAL_ANIM, 10, nullptr);
         if (HasAnyActiveCycle()) SetTimer(g_hCycleWidget, TIMER_WIDGET_TICK, 500, nullptr);
-        RenderCycleWidgetLayered(g_hCycleWidget);
     } else {
         KillTimer(g_hCycleWidget, TIMER_WIDGET_TICK);
         if (IsWindowVisible(g_hCycleWidget)) {
@@ -6079,10 +6197,86 @@ static void SyncCycleWidgetWindow(bool reposition) {
         }
         return;
     }
-    if (g_hCycleWidget && IsWindow(g_hCycleWidget) && IsWindowVisible(g_hCycleWidget)) {
-        if (HasAnyActiveCycle()) SetTimer(g_hCycleWidget, TIMER_WIDGET_TICK, 500, nullptr);
-        else KillTimer(g_hCycleWidget, TIMER_WIDGET_TICK);
-        if (reposition) RenderCycleWidgetLayered(g_hCycleWidget);
+    if (g_hCycleWidget && IsWindow(g_hCycleWidget)) {
+        if (IsWindowVisible(g_hCycleWidget)) {
+            if (HasAnyActiveCycle()) SetTimer(g_hCycleWidget, TIMER_WIDGET_TICK, 500, nullptr);
+            else KillTimer(g_hCycleWidget, TIMER_WIDGET_TICK);
+            if (reposition) RenderCycleWidgetLayered(g_hCycleWidget);
+        } else if (reposition) {
+            RECT wrc{};
+            ComputeCycleWidgetRect(wrc, 0.0);
+            SetWindowPos(g_hCycleWidget, HWND_TOPMOST, wrc.left, wrc.top,
+                         wrc.right - wrc.left, wrc.bottom - wrc.top,
+                         SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+    }
+}
+
+static bool IsMonitorSwitchBlocked() {
+    if (g_drag.dragging) return true;
+    if (g_uiState != UiState::Line || g_expandClock.active) return true;
+    if (g_mouseInside) return true;
+    if (g_cycleWidgetHover || g_cycleWidgetPressed) return true;
+    if (g_hasPendingNavigateCycle) return true;
+    if (g_hCyclePopup && IsWindow(g_hCyclePopup)) return true;
+    return false;
+}
+
+static bool IsCursorInActiveSeamZone(HWND hwnd, POINT cur) {
+    if (!hwnd) return false;
+    RECT pillRc{}, wrc{};
+    ComputeTargetRect(0.0, pillRc);
+    ComputeCycleWidgetRect(wrc, 1.0);
+    RECT zone{};
+    UnionRect(&zone, &pillRc, &wrc);
+    UINT dpi = GetDpiForWindow(hwnd);
+    int seamGuard = DpiScale(44, dpi);
+    InflateRect(&zone, seamGuard, seamGuard);
+    return PtInRect(&zone, cur) != FALSE;
+}
+
+static void EvaluateMonitorFollow(HWND hwnd) {
+    if (!hwnd) return;
+    bool followMon = false;
+    int delaySec = 5;
+    {
+        std::lock_guard<std::mutex> lk(g_settingsMtx);
+        followMon = g_settings.followCursorMonitor;
+        delaySec = g_settings.followCursorDelaySec;
+    }
+    HMONITOR activeMon = GetTargetMonitor(followMon);
+    if (!followMon || g_hiddenByFullscreen || IsMonitorSwitchBlocked()) {
+        g_candidateMonitor = nullptr;
+        g_candidateMonitorEnterTick = 0;
+        return;
+    }
+    POINT cur{};
+    if (!GetCursorPos(&cur)) return;
+    if (IsCursorInActiveSeamZone(hwnd, cur)) {
+        g_candidateMonitor = nullptr;
+        g_candidateMonitorEnterTick = 0;
+        return;
+    }
+    HMONITOR curMon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
+    if (!curMon || curMon == activeMon) {
+        g_candidateMonitor = nullptr;
+        g_candidateMonitorEnterTick = 0;
+        return;
+    }
+    ULONGLONG nowTick = GetTickCount64();
+    if (curMon != g_candidateMonitor) {
+        g_candidateMonitor = curMon;
+        g_candidateMonitorEnterTick = nowTick;
+        if (delaySec > 0) return;
+    }
+    ULONGLONG requiredMs = (ULONGLONG)std::clamp(delaySec, 0, 60) * 1000ULL;
+    if (nowTick - g_candidateMonitorEnterTick >= requiredMs) {
+        HMONITOR prevMon = g_activeMonitor;
+        g_activeMonitor = curMon;
+        g_candidateMonitor = nullptr;
+        g_candidateMonitorEnterTick = 0;
+        RemapSavedPositionBetweenMonitors(prevMon, g_activeMonitor);
+        UpdateWindowGeometry(true);
     }
 }
 
@@ -6282,6 +6476,9 @@ static LRESULT CALLBACK FloatingWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     g_settings.dockEdge = snapped;
                 }
                 Wh_SetIntValue(L"dockEdgeOverride", (int)snapped);
+                g_activeMonitor = mon;
+                g_candidateMonitor = nullptr;
+                g_candidateMonitorEnterTick = 0;
                 g_posX = rc.left;
                 g_posY = rc.top;
                 g_posLoaded = true;
@@ -6370,14 +6567,10 @@ static LRESULT CALLBACK FloatingWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                         UpdateWindowGeometry(false);
                     }
                 }
+            } else if (wParam == TIMER_MONITOR_SWITCH) {
+                EvaluateMonitorFollow(hwnd);
             } else if (wParam == TIMER_WIDGET_PROXIMITY) {
-                bool followMon = false;
-                { std::lock_guard<std::mutex> lk(g_settingsMtx); followMon = g_settings.followCursorMonitor; }
-                if (followMon && g_uiState == UiState::Line && !g_drag.dragging && !g_hiddenByFullscreen) {
-                    if (GetTargetMonitor(true) != MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) {
-                        UpdateWindowGeometry(true);
-                    }
-                }
+                EvaluateMonitorFollow(hwnd);
                 if (!ShouldWidgetBeAvailable()) {
                     if (g_widgetRevealed) SetCycleWidgetRevealed(false);
                     KillTimer(hwnd, TIMER_WIDGET_PROXIMITY);
@@ -6694,6 +6887,7 @@ static LRESULT CALLBACK FloatingWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             KillTimer(hwnd, TIMER_DEBOUNCE_REFRESH);
             KillTimer(hwnd, TIMER_WIDGET_PROXIMITY);
             KillTimer(hwnd, TIMER_OUTSIDE_CLICK);
+            KillTimer(hwnd, TIMER_MONITOR_SWITCH);
             if (g_hCyclePopup && IsWindow(g_hCyclePopup)) DestroyWindow(g_hCyclePopup);
             DestroyCycleWidgetWindow();
             for (int id = 1; id <= 3; ++id) UnregisterHotKey(hwnd, id);
@@ -6942,14 +7136,17 @@ BOOL Wh_ModInit() {
 
     if (isCurrentToolModProcess) {
         g_toolModProcessMutex =
-            CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
+            CreateMutex(nullptr, FALSE, L"windhawk-tool-mod_" WH_MOD_ID);
         if (!g_toolModProcessMutex) {
             Wh_Log(L"CreateMutex failed");
             ExitProcess(1);
         }
 
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        DWORD waitRes = WaitForSingleObject(g_toolModProcessMutex, 5000);
+        if (waitRes != WAIT_OBJECT_0 && waitRes != WAIT_ABANDONED) {
             Wh_Log(L"Tool mod already running (%s)", WH_MOD_ID);
+            CloseHandle(g_toolModProcessMutex);
+            g_toolModProcessMutex = nullptr;
             ExitProcess(1);
         }
 
@@ -7048,6 +7245,12 @@ void Wh_ModSettingsChanged() {
 void Wh_ModUninit() {
     if (g_isToolModProcessLauncher) {
         return;
+    }
+
+    if (g_toolModProcessMutex) {
+        ReleaseMutex(g_toolModProcessMutex);
+        CloseHandle(g_toolModProcessMutex);
+        g_toolModProcessMutex = nullptr;
     }
 
     WhTool_ModUninit();
