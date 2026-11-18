@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              autoclean
 // @name            AutoClean
-// @description     Zero-UI event-driven background temp cleaner with KB/MB/GB/TB thresholds, oldest-first pruning, and smart deferral
-// @version         1.2026.1811
+// @description     Zero-UI event-driven background temp cleaner with AI agent temp protection, KB/MB/GB/TB thresholds, oldest-first pruning, and OLED toasts
+// @version         2.2026.1811
 // @author          Ashish
 // @github          https://github.com/k-ashix
 // @twitter         https://x.com/k_ashix
@@ -36,12 +36,41 @@ Silent, zero-UI background temporary folder cleaner running in a dedicated Windh
 - **Background I/O Priority**: Runs scans and deletions under `THREAD_MODE_BACKGROUND_BEGIN` so foreground builds, Photoshop, Blender, and games never stall.
 - **Fullscreen & Battery Smart Deferral**: Automatically defers non-emergency runs during fullscreen apps/games or on battery power.
 - **Low-Disk Emergency Floor**: Triggers an immediate cleanup if drive free space drops below your `MB`/`GB`/`TB` floor.
+- **AI Agents Temp Protection**: Respects local `%TEMP%` folders created by AI coding & desktop agents (Claude Code, Codex, Hermes Agent, OpenClaw, Gemini CLI, OpenCode, Cursor, Windsurf, Goose, Aider, Copilot, MCP) by default, with a configurable pattern list so agents manage their own scratchpads and worktrees.
 - **Security & Safety Guards**: Strict `%TEMP%` allowlist (`C:\Windows\Temp` opt-in without UAC), reparse-point/junction/symlink blocking, Windows file-lock respect, minimum file age grace period, wildcard exclusions, and Dry-Run logging.
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
+- aiAgentProtection:
+  - protectionMode: Enabled
+    $name: Let AI agents handle their own Temp
+    $description: Keep local %TEMP% folders and scratchpads owned by AI agents untouched during all automatic, scheduled, startup, and manual Temp cleanups.
+    $options:
+    - Enabled: On — Respect AI agents' local Temp folders (Recommended)
+    - Disabled: Off — Clean AI agent Temp files too
+  - agentTempPatterns:
+    - "claude*"
+    - "tmpclaude-*"
+    - "wvm-*"
+    - "codex*"
+    - "openai-codex*"
+    - "hermes*"
+    - ".hermes*"
+    - "openclaw*"
+    - ".openclaw*"
+    - "gemini-*"
+    - "opencode*"
+    - "cursor-*"
+    - "windsurf-*"
+    - "goose-*"
+    - "aider*"
+    - "copilot-*"
+    - "mcp-*"
+    $name: Protected AI agent Temp folder & file patterns
+    $description: Wildcard folder/file names inside %TEMP% to preserve for AI agents (e.g. claude*, codex*, hermes*, openclaw*). Add your own custom agent patterns here.
+  $name: 1. AI Agents Temp Protection
 - tempCleaner:
   - thresholdEnabled: true
     $name: Enable Temp size threshold trigger
@@ -109,7 +138,7 @@ Silent, zero-UI background temporary folder cleaner running in a dedicated Windh
     - "windhawk*"
     $name: Exclude wildcard patterns
     $description: File or folder name patterns to skip (e.g. *.lock, windhawk*).
-  $name: 1. Temp Folder Cleaner
+  $name: 2. Temp Folder Cleaner
 - recycleBinCleaner:
   - sizeThresholdEnabled: true
     $name: Enable Recycle Bin size threshold
@@ -181,7 +210,7 @@ Silent, zero-UI background temporary folder cleaner running in a dedicated Windh
   - playSound: false
     $name: Play Windows sound when emptied
     $description: Play the standard Windows Recycle Bin sound on full empty.
-  $name: 2. Recycle Bin Cleaner
+  $name: 3. Recycle Bin Cleaner
 - universalSafety:
   - cleanTempOnStart: true
     $name: Clean Temp folders on startup
@@ -228,9 +257,12 @@ Silent, zero-UI background temporary folder cleaner running in a dedicated Windh
   - toastEnabled: true
     $name: Show OLED corner toast notification
     $description: Display an OLED black corner toast when Temp or Recycle Bin cleanup runs.
-  - toastShowOnAutoClean: false
-    $name: Show toast on automatic cleanups too
-    $description: Show the toast when startup, threshold, timer, or emergency cleanups free space (off by default so background runs stay silent).
+  - toastTriggerScope: AllCleanups
+    $name: When to show toast notifications
+    $description: Show OLED corner toasts for both scheduled/automatic cleanups and manual shortcuts, or manual shortcuts only.
+    $options:
+    - AllCleanups: All cleanups — Scheduled, Automatic & Manual (Recommended)
+    - ManualOnly: Manual mouse shortcuts only
   - toastDurationMs: 3200
     $name: Toast display duration (ms)
     $description: How long the corner toast stays visible before fading out (1200 to 10000 ms).
@@ -243,7 +275,7 @@ Silent, zero-UI background temporary folder cleaner running in a dedicated Windh
   - dryRun: false
     $name: Dry-run preview mode (single-shot simulation, no deletions)
     $description: Runs a single simulation pass on screen showing what would be cleaned without touching any file.
-  $name: 3. Universal, Toast & Safety
+  $name: 4. Universal, Toast & Safety
 */
 // ==/WindhawkModSettings==
 
@@ -262,6 +294,7 @@ Silent, zero-UI background temporary folder cleaner running in a dedicated Windh
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <string>
 #include <vector>
@@ -294,6 +327,8 @@ struct ModSettings {
     uint64_t cooldownMs = 30000ULL;
     bool cleanWindowsTemp = false;
     bool dryRun = false;
+    bool aiAgentProtectionEnabled = true;
+    std::vector<std::wstring> aiAgentPatterns;
     std::vector<std::wstring> excludePatterns;
 
     // Startup & Windows Login (12s post-login lazy start)
@@ -332,7 +367,7 @@ struct ModSettings {
 
     // Corner Toast Feedback & Screenshot Visibility
     bool toastEnabled = true;
-    bool toastShowOnAuto = false;
+    bool toastShowOnAuto = true;
     uint32_t toastDurationMs = 3200U;
     bool toastExcludeFromCapture = true;
 };
@@ -355,7 +390,7 @@ static std::atomic<bool> g_tempGestureEnabled{true};
 static std::atomic<int> g_tempGestureScope{0};
 static std::atomic<uint32_t> g_tempGestureMaxIntervalMs{400};
 static std::atomic<bool> g_toastEnabled{true};
-static std::atomic<bool> g_toastShowOnAuto{false};
+static std::atomic<bool> g_toastShowOnAuto{true};
 static std::atomic<uint32_t> g_toastDurationMs{3200};
 static std::atomic<bool> g_toastExcludeFromCapture{true};
 
@@ -510,6 +545,40 @@ static std::vector<std::wstring> GetTargetTempDirs(const ModSettings& cfg) {
     return dirs;
 }
 
+static std::wstring NormalizeExcludePattern(PCWSTR raw) {
+    if (!raw) return L"";
+    std::wstring s(raw);
+    while (!s.empty() && (s.front() == L' ' || s.front() == L'\t' || s.front() == L'\\' || s.front() == L'/')) {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L'\\' || s.back() == L'/')) {
+        s.pop_back();
+    }
+    return s;
+}
+
+static std::vector<std::wstring> DefaultAiAgentPatterns() {
+    return {
+        L"claude*",
+        L"tmpclaude-*",
+        L"wvm-*",
+        L"codex*",
+        L"openai-codex*",
+        L"hermes*",
+        L".hermes*",
+        L"openclaw*",
+        L".openclaw*",
+        L"gemini-*",
+        L"opencode*",
+        L"cursor-*",
+        L"windsurf-*",
+        L"goose-*",
+        L"aider*",
+        L"copilot-*",
+        L"mcp-*",
+    };
+}
+
 static bool IsExcludedName(const wchar_t* name, const std::vector<std::wstring>& patterns) {
     for (const auto& pat : patterns) {
         if (!pat.empty() && PathMatchSpecW(name, pat.c_str())) {
@@ -517,6 +586,13 @@ static bool IsExcludedName(const wchar_t* name, const std::vector<std::wstring>&
         }
     }
     return false;
+}
+
+static bool IsProtectedAiAgentName(const wchar_t* name, const ModSettings& cfg) {
+    if (!cfg.aiAgentProtectionEnabled) {
+        return false;
+    }
+    return IsExcludedName(name, cfg.aiAgentPatterns);
 }
 
 static uint64_t FileTimeToU64(const FILETIME& ft) {
@@ -1091,6 +1167,7 @@ struct ToastPayload {
     std::wstring title;
     std::wstring subtitle;
     uint32_t durationMs = 3200;
+    bool isManual = false;
 };
 
 struct ToastWindowState {
@@ -1107,6 +1184,7 @@ struct ToastWindowState {
     int heightPx = 0;
     HBITMAP hDib = nullptr;
     void* dibBits = nullptr;
+    std::deque<ToastPayload> pendingQueue;
 };
 
 static ToastWindowState g_toast;
@@ -1216,13 +1294,12 @@ static void RenderToastContent(const std::wstring& title, const std::wstring& su
         return MulDiv(logical, static_cast<int>(dpi), 96);
     };
 
-    // Determine semantic state for fill-only accent bar & pill badge
+    // Determine semantic state for fill-only left accent bar
     bool isDryRun = (title.find(L"DRY RUN") != std::wstring::npos || title.find(L"Dry-Run") != std::wstring::npos);
     bool isError = (title.find(L"Error") != std::wstring::npos);
     bool isEmpty = (title.find(L"Empty") != std::wstring::npos || title.find(L"Already Clean") != std::wstring::npos);
 
     // Strictly warm Terracotta & Tan palette (zero blue/cool tones)
-    const wchar_t* badgeText = isDryRun ? L"DRY RUN" : (isError ? L"ERROR" : (isEmpty ? L"CLEAN" : L"FREED"));
     Gdiplus::Color accentFill = isDryRun
         ? Gdiplus::Color(255, 224, 138, 68)   // Warm amber-terracotta (#E08A44) for Dry-Run preview
         : (isError
@@ -1231,20 +1308,11 @@ static void RenderToastContent(const std::wstring& title, const std::wstring& su
                 ? Gdiplus::Color(255, 212, 163, 115) // Warm desert tan (#D4A373) for Already Clean / Empty
                 : Gdiplus::Color(255, 217, 119, 87))); // Signature terracotta orange (#D97757) for Cleaned/Freed
 
-    Gdiplus::Color badgeBgFill = isDryRun
-        ? Gdiplus::Color(255, 38, 22, 12)
-        : (isError
-            ? Gdiplus::Color(255, 38, 16, 12)
-            : (isEmpty
-                ? Gdiplus::Color(255, 34, 24, 16)
-                : Gdiplus::Color(255, 36, 20, 14)));
-
     int accentBarW = (std::max)(3, scale(3));
     int leftInset = scale(12) + accentBarW + scale(10);
     int rightPad = scale(16);
     int padY = scale(12);
     int gapY = scale(4);
-    int badgeGapX = scale(10);
     int minW = scale(240);
     int maxW = scale(460);
     float radius = static_cast<float>(scale(12));
@@ -1252,12 +1320,10 @@ static void RenderToastContent(const std::wstring& title, const std::wstring& su
     // Exact physical-pixel font sizes (UnitPixel) prevent GDI+ 96-DPI bitmap point under-scaling blur
     float titlePx = static_cast<float>(MulDiv(13, static_cast<int>(dpi), 96));
     float subPx = static_cast<float>(MulDiv(11, static_cast<int>(dpi), 96));
-    float badgePx = static_cast<float>(MulDiv(10, static_cast<int>(dpi), 96));
 
     Gdiplus::FontFamily ff(L"Segoe UI");
     Gdiplus::Font titleFont(&ff, titlePx, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     Gdiplus::Font subFont(&ff, subPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-    Gdiplus::Font badgeFont(&ff, badgePx, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     const Gdiplus::StringFormat* fmt = Gdiplus::StringFormat::GenericTypographic();
 
     HDC hdcScreen = GetDC(nullptr);
@@ -1266,21 +1332,14 @@ static void RenderToastContent(const std::wstring& title, const std::wstring& su
     measureG.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
     Gdiplus::RectF layoutMax(0.0f, 0.0f, static_cast<float>(maxW - leftInset - rightPad), 240.0f);
-    Gdiplus::RectF titleBox{}, subBox{}, badgeBox{};
+    Gdiplus::RectF titleBox{}, subBox{};
     measureG.MeasureString(title.c_str(), -1, &titleFont, layoutMax, fmt, &titleBox);
     measureG.MeasureString(subtitle.c_str(), -1, &subFont, layoutMax, fmt, &subBox);
-    measureG.MeasureString(badgeText, -1, &badgeFont, layoutMax, fmt, &badgeBox);
     ReleaseDC(nullptr, hdcScreen);
 
-    int badgePadX = scale(7);
-    int badgePadY = scale(3);
-    int badgeW = static_cast<int>(std::ceil(badgeBox.Width)) + badgePadX * 2;
-    int badgeH = static_cast<int>(std::ceil(badgeBox.Height)) + badgePadY * 2;
-
-    int titleH = (std::max)(static_cast<int>(std::ceil(titleBox.Height)), badgeH);
+    int titleH = static_cast<int>(std::ceil(titleBox.Height));
     int subH = static_cast<int>(std::ceil(subBox.Height));
-    int topRowW = static_cast<int>(std::ceil(titleBox.Width)) + badgeGapX + badgeW;
-    int contentW = (std::max)(topRowW, static_cast<int>(std::ceil(subBox.Width)));
+    int contentW = (std::max)(static_cast<int>(std::ceil(titleBox.Width)), static_cast<int>(std::ceil(subBox.Width)));
     int w = (std::min)(maxW, (std::max)(minW, leftInset + contentW + rightPad));
     int h = padY * 2 + titleH + gapY + subH;
 
@@ -1338,30 +1397,11 @@ static void RenderToastContent(const std::wstring& title, const std::wstring& su
         Gdiplus::SolidBrush accentBrush(accentFill);
         g.FillPath(&accentBrush, &accentBarPath);
 
-        // 4. Status pill badge on top-right (pure fill, no stroke)
-        int badgeX = w - rightPad - badgeW;
-        int badgeY = padY + (titleH - badgeH) / 2;
-        Gdiplus::GraphicsPath badgePath;
-        BuildRoundedRectPath(
-            badgePath,
-            static_cast<float>(badgeX),
-            static_cast<float>(badgeY),
-            static_cast<float>(badgeW),
-            static_cast<float>(badgeH),
-            static_cast<float>(badgeH) * 0.5f);
-        Gdiplus::SolidBrush badgeBgBrush(badgeBgFill);
-        g.FillPath(&badgeBgBrush, &badgePath);
-
-        Gdiplus::PointF ptBadge(
-            static_cast<float>(badgeX + badgePadX),
-            static_cast<float>(badgeY + badgePadY));
-        g.DrawString(badgeText, -1, &badgeFont, ptBadge, fmt, &accentBrush);
-
-        // 5. Crisp integer-snapped title and subtitle glyphs (warm cream & muted tan)
+        // 4. Crisp integer-snapped title and subtitle glyphs (warm cream & muted tan)
         Gdiplus::SolidBrush titleBrush(Gdiplus::Color(255, 245, 240, 235));
         Gdiplus::SolidBrush subBrush(Gdiplus::Color(255, 196, 178, 162));
 
-        int titleY = padY + (titleH - static_cast<int>(std::ceil(titleBox.Height))) / 2;
+        int titleY = padY;
         Gdiplus::PointF ptTitle(static_cast<float>(leftInset), static_cast<float>(titleY));
         Gdiplus::PointF ptSub(
             static_cast<float>(leftInset),
@@ -1401,7 +1441,9 @@ static void RenderToastContent(const std::wstring& title, const std::wstring& su
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
-static void HideToastImmediate() {
+static void DisplayToastPayload(const ToastPayload& item);
+
+static void HideToastImmediate(bool drainQueue = true) {
     if (!g_toast.hwnd) return;
     KillTimer(g_toast.hwnd, kToastAnimTimerId);
     KillTimer(g_toast.hwnd, kToastHideTimerId);
@@ -1410,6 +1452,12 @@ static void HideToastImmediate() {
     g_toast.hovered = false;
     g_toast.fadingOut = false;
     g_toast.currentAlpha = 0;
+
+    if (drainQueue && !g_stopRequested.load(std::memory_order_relaxed) && !g_toast.pendingQueue.empty()) {
+        ToastPayload nextItem = std::move(g_toast.pendingQueue.front());
+        g_toast.pendingQueue.pop_front();
+        DisplayToastPayload(nextItem);
+    }
 }
 
 static LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1511,16 +1559,9 @@ static void EnsureToastWindowCreated() {
     ApplyToastCaptureAffinity();
 }
 
-static void HandleToastShowMessage(LPARAM lParam) {
-    auto* payload = reinterpret_cast<ToastPayload*>(lParam);
-    if (!payload) return;
-
-    std::wstring title = std::move(payload->title);
-    std::wstring subtitle = std::move(payload->subtitle);
-    uint32_t durationMs = payload->durationMs;
-    delete payload;
-
+static void DisplayToastPayload(const ToastPayload& item) {
     if (g_toastExcludeFromCapture.load(std::memory_order_relaxed) && IsCaptureOverlayActive()) {
+        g_toast.pendingQueue.clear();
         return;
     }
 
@@ -1532,17 +1573,43 @@ static void HandleToastShowMessage(LPARAM lParam) {
     KillTimer(g_toast.hwnd, kToastHideTimerId);
 
     g_toast.visible = true;
+    g_toast.hovered = false;
     g_toast.fadingOut = false;
-    g_toast.durationMs = durationMs;
+    g_toast.durationMs = item.durationMs;
 
-    RenderToastContent(title, subtitle);
+    RenderToastContent(item.title, item.subtitle);
     PresentToastAlpha(0);
 
     LARGE_INTEGER qpc{};
     QueryPerformanceCounter(&qpc);
     g_toast.animStartQpc = static_cast<uint64_t>(qpc.QuadPart);
     SetTimer(g_toast.hwnd, kToastAnimTimerId, 16, nullptr);
-    SetTimer(g_toast.hwnd, kToastHideTimerId, durationMs, nullptr);
+    SetTimer(g_toast.hwnd, kToastHideTimerId, item.durationMs, nullptr);
+}
+
+static void HandleToastShowMessage(LPARAM lParam) {
+    auto* payload = reinterpret_cast<ToastPayload*>(lParam);
+    if (!payload) return;
+
+    ToastPayload item = std::move(*payload);
+    delete payload;
+
+    if (g_toastExcludeFromCapture.load(std::memory_order_relaxed) && IsCaptureOverlayActive()) {
+        return;
+    }
+
+    // Queue back-to-back automatic toasts (e.g. Startup Temp + Recycle Bin) so neither overwrites the other
+    if (g_toast.visible && !item.isManual) {
+        if (g_toast.pendingQueue.size() < 4) {
+            g_toast.pendingQueue.push_back(std::move(item));
+        }
+        return;
+    }
+
+    if (item.isManual) {
+        g_toast.pendingQueue.clear();
+    }
+    DisplayToastPayload(item);
 }
 
 static LRESULT CALLBACK UiMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1617,6 +1684,7 @@ static DWORD WINAPI UiThreadProc(LPVOID) {
         DispatchMessageW(&msg);
     }
 
+    g_toast.pendingQueue.clear();
     if (g_toast.hwnd) {
         KillTimer(g_toast.hwnd, kToastAnimTimerId);
         KillTimer(g_toast.hwnd, kToastHideTimerId);
@@ -2155,6 +2223,7 @@ struct CleanStats {
     uint64_t skippedLocked = 0;
     uint64_t skippedRecent = 0;
     uint64_t skippedExcluded = 0;
+    uint64_t skippedProtectedAgents = 0;
     uint64_t skippedReparse = 0;
 };
 
@@ -2169,7 +2238,7 @@ struct DirCandidate {
     size_t depth = 0;
 };
 
-static uint64_t MeasureDirectoryBytes(const std::wstring& extDir, const std::vector<std::wstring>& excludes) {
+static uint64_t MeasureDirectoryBytes(const std::wstring& extDir, const ModSettings& cfg) {
     if (g_stopRequested.load(std::memory_order_relaxed)) {
         return 0;
     }
@@ -2193,11 +2262,11 @@ static uint64_t MeasureDirectoryBytes(const std::wstring& extDir, const std::vec
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
             continue;
         }
-        if (IsExcludedName(fd.cFileName, excludes)) {
+        if (IsProtectedAiAgentName(fd.cFileName, cfg) || IsExcludedName(fd.cFileName, cfg.excludePatterns)) {
             continue;
         }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            total += MeasureDirectoryBytes(extDir + L"\\" + fd.cFileName, excludes);
+            total += MeasureDirectoryBytes(extDir + L"\\" + fd.cFileName, cfg);
         } else {
             uint64_t fileSize = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
             total += fileSize;
@@ -2242,6 +2311,10 @@ static void CollectCandidatesRecursive(
             continue;
         }
         if (_wcsicmp(fd.cFileName, L"desktop.ini") == 0) {
+            continue;
+        }
+        if (IsProtectedAiAgentName(fd.cFileName, cfg)) {
+            stats.skippedProtectedAgents++;
             continue;
         }
         if (IsExcludedName(fd.cFileName, cfg.excludePatterns)) {
@@ -2392,7 +2465,7 @@ static CleanStats RunCleanupPass(const ModSettings& cfg, const wchar_t* reason, 
     PersistTelemetry(stats.bytesFreed, reason, cfg.dryRun);
 
     Wh_Log(
-        L"AutoClean [%s | %s]%s: freed %llu bytes (%llu files, %llu dirs); scanned=%llu skipped locked=%llu recent=%llu excluded=%llu reparse=%llu",
+        L"AutoClean [%s | %s]%s: freed %llu bytes (%llu files, %llu dirs); scanned=%llu skipped locked=%llu recent=%llu aiAgents=%llu excluded=%llu reparse=%llu",
         reason,
         useOldestFirst ? L"OldestFirst" : L"FullSweep",
         cfg.dryRun ? L" (DRY-RUN ONLY)" : L"",
@@ -2402,13 +2475,15 @@ static CleanStats RunCleanupPass(const ModSettings& cfg, const wchar_t* reason, 
         static_cast<unsigned long long>(stats.totalBytesScanned),
         static_cast<unsigned long long>(stats.skippedLocked),
         static_cast<unsigned long long>(stats.skippedRecent),
+        static_cast<unsigned long long>(stats.skippedProtectedAgents),
         static_cast<unsigned long long>(stats.skippedExcluded),
         static_cast<unsigned long long>(stats.skippedReparse));
     return stats;
 }
 
 static void NotifyTempToast(const CleanStats& stats, bool dryRun, bool isManual) {
-    if (!isManual && !dryRun && stats.bytesFreed == 0) {
+    bool didCleanSomething = (stats.bytesFreed > 0 || stats.filesDeleted > 0 || stats.dirsDeleted > 0);
+    if (!isManual && !dryRun && !didCleanSomething) {
         return;
     }
     std::wstring title;
@@ -2417,10 +2492,14 @@ static void NotifyTempToast(const CleanStats& stats, bool dryRun, bool isManual)
         title = L"DRY RUN ONLY — Temp Not Cleaned";
         subtitle = L"Simulation only: Would free " + FormatBytesHuman(stats.bytesFreed) +
                    L" (" + std::to_wstring(stats.filesDeleted) + L" files untouched)";
-    } else if (stats.bytesFreed > 0) {
+    } else if (didCleanSomething) {
         title = L"Temp Cleaned";
         subtitle = L"Freed " + FormatBytesHuman(stats.bytesFreed) +
-                   L" (" + std::to_wstring(stats.filesDeleted) + L" files)";
+                   L" (" + std::to_wstring(stats.filesDeleted) + L" files";
+        if (stats.dirsDeleted > 0) {
+            subtitle += L", " + std::to_wstring(stats.dirsDeleted) + L" folders";
+        }
+        subtitle += L")";
     } else {
         title = L"Temp Already Clean";
         if (stats.skippedLocked > 0 || stats.skippedRecent > 0) {
@@ -2435,7 +2514,8 @@ static void NotifyTempToast(const CleanStats& stats, bool dryRun, bool isManual)
 
 static void NotifyRecycleToast(const RecycleCleanResult& res, bool isManual) {
     bool isDryRun = (res.status == RecycleCleanStatus::DryRun);
-    if (!isManual && !isDryRun && res.bytesFreed == 0) {
+    bool didCleanSomething = (res.bytesFreed > 0 || res.itemsCleaned > 0);
+    if (!isManual && !isDryRun && !didCleanSomething) {
         return;
     }
     std::wstring title;
@@ -2768,7 +2848,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID) {
                 BOOL bgEntered = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
                 uint64_t totalSize = 0;
                 for (const auto& dir : GetTargetTempDirs(cfg)) {
-                    totalSize += MeasureDirectoryBytes(ToExtendedPath(dir), cfg.excludePatterns);
+                    totalSize += MeasureDirectoryBytes(ToExtendedPath(dir), cfg);
                 }
                 if (bgEntered) {
                     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
@@ -2883,7 +2963,29 @@ static void LoadSettings() {
     bool rbGroupSaved = (Wh_GetIntSetting(L"recycleBinCleaner.sizeThresholdValue") > 0);
     bool univGroupSaved = (Wh_GetIntSetting(L"universalSafety.freeSpaceValue") > 0);
 
-    // 1. Temp Folder Cleaner
+    // 1. AI Agents Temp Protection (upgrade-safe: defaults to Enabled + built-in list when unsaved)
+    PCWSTR aiModeStr = Wh_GetStringSetting(L"aiAgentProtection.protectionMode");
+    bool aiGroupSaved = (aiModeStr && *aiModeStr);
+    next.aiAgentProtectionEnabled = !aiGroupSaved || wcscmp(aiModeStr, L"Disabled") != 0;
+    Wh_FreeStringSetting(aiModeStr);
+
+    for (int i = 0;; i++) {
+        PCWSTR pat = Wh_GetStringSetting(L"aiAgentProtection.agentTempPatterns[%d]", i);
+        if (!pat || !*pat) {
+            if (pat) Wh_FreeStringSetting(pat);
+            break;
+        }
+        std::wstring cleanPat = NormalizeExcludePattern(pat);
+        if (!cleanPat.empty()) {
+            next.aiAgentPatterns.push_back(std::move(cleanPat));
+        }
+        Wh_FreeStringSetting(pat);
+    }
+    if (next.aiAgentPatterns.empty() && !aiGroupSaved) {
+        next.aiAgentPatterns = DefaultAiAgentPatterns();
+    }
+
+    // 2. Temp Folder Cleaner
     next.thresholdEnabled = tempGroupSaved ? (Wh_GetIntSetting(L"tempCleaner.thresholdEnabled") != 0) : true;
     int rawThresh = tempGroupSaved ? Wh_GetIntSetting(L"tempCleaner.thresholdValue") : 500;
     if (rawThresh < 1) rawThresh = 500;
@@ -2939,7 +3041,10 @@ static void LoadSettings() {
             if (pat) Wh_FreeStringSetting(pat);
             break;
         }
-        next.excludePatterns.emplace_back(pat);
+        std::wstring cleanPat = NormalizeExcludePattern(pat);
+        if (!cleanPat.empty()) {
+            next.excludePatterns.push_back(std::move(cleanPat));
+        }
         Wh_FreeStringSetting(pat);
     }
     if (next.excludePatterns.empty() && !tempGroupSaved) {
@@ -3036,7 +3141,9 @@ static void LoadSettings() {
     next.tempGestureMaxIntervalMs = static_cast<uint64_t>(maxIntMs);
 
     next.toastEnabled = univGroupSaved ? (Wh_GetIntSetting(L"universalSafety.toastEnabled") != 0) : true;
-    next.toastShowOnAuto = univGroupSaved ? (Wh_GetIntSetting(L"universalSafety.toastShowOnAutoClean") != 0) : false;
+    PCWSTR toastScopeStr = Wh_GetStringSetting(L"universalSafety.toastTriggerScope");
+    next.toastShowOnAuto = !toastScopeStr || !*toastScopeStr || wcscmp(toastScopeStr, L"ManualOnly") != 0;
+    Wh_FreeStringSetting(toastScopeStr);
     int toastDur = univGroupSaved ? Wh_GetIntSetting(L"universalSafety.toastDurationMs") : 3200;
     if (toastDur < 1200) toastDur = 1200;
     if (toastDur > 10000) toastDur = 10000;
@@ -3083,6 +3190,7 @@ static void ShowCleanToast(const std::wstring& title, const std::wstring& subtit
         title,
         subtitle,
         g_toastDurationMs.load(std::memory_order_relaxed),
+        isManual,
     };
     if (!PostMessageW(g_uiMsgHwnd, WM_APP_SHOW_TOAST, 0, reinterpret_cast<LPARAM>(payload))) {
         delete payload;
